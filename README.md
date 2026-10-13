@@ -305,10 +305,13 @@ Trusted project:
   "proactivePrompt": true,
   "verificationPrompt": true,
   "verificationFileThreshold": 3,
+  "statusLine": true,
   "cleanupPeriodDays": null,
   "interruptedTaskResume": "notify"
 }
 ```
+
+`statusLine` controls the TUI indicator (interactive mode only): while at least one task is running, a right-aligned line above the input box shows `⚙ N subagent(s) running: <name> t<turns>, …` (user task name when set, else the agent role; names longer than 16 characters are truncated, only the first four are listed). The line updates as tasks start, progress, complete, stop, or resume, and disappears when the last task finishes or the session shuts down. Set `"statusLine": false` to hide it.
 
 The public `Agent` schema requires `warning_turns` and `warning_interval_turns` on every root call. The runtime fallback and general recommendation are `40 / 25`. The caller should override that pair only when task scope, uncertainty, drift/stall risk, tool cost, or external waiting materially warrants one of the documented ranges. Tasks-array entries inherit top-level values unless their risk materially differs. Warnings are supervision checkpoints rather than timeout signals, and children emit more frequent concise stage notes independently of the warning schedule. Defaults leave hard timeout, turn, tool, and cleanup budgets unset. Positive `cleanupPeriodDays` enables age-based retention cleanup. Legacy `maxOutputChars` still maps to `maxOutputBytes`. Bundled roles declare no hard budgets; custom frontmatter and runtime config can still define advanced unattended policies.
 

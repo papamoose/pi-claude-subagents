@@ -10,6 +10,8 @@ import register, {
   buildNotificationMessage,
   createBackgroundNotifiers,
   createCompletionDeduper,
+  createSubagentStatusComponent,
+  formatSubagentStatus,
   formatTaskDiagnostic,
   inheritTaskWarningPolicy,
   isStaleExtensionContextError,
@@ -18,7 +20,8 @@ import register, {
   taskNotification,
   waitForLaunchedForegroundTasks,
 } from "../src/index.ts";
-import { DEFAULT_CONFIG } from "../src/config.ts";
+import { applyConfig, DEFAULT_CONFIG } from "../src/config.ts";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { createTaskQuota, type ProgressWarningDetails } from "../src/runtime.ts";
 import { getAgentDir, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { appendTaskOutput, formatTaskOutputForModel, saveTaskOutput, type LiveTask, type TaskRecord } from "../src/tasks.ts";
@@ -981,4 +984,114 @@ test("before_agent_start stays fully silent when proactivePrompt is disabled", (
   } finally {
     fs.rmSync(cwd, { recursive: true, force: true });
   }
+});
+
+// --- footer status line ---
+
+test("formatSubagentStatus summarizes running tasks and clears when idle", () => {
+  assert.equal(formatSubagentStatus([]), undefined);
+
+  const one = runningTask("task-a");
+  assert.equal(formatSubagentStatus([one]), "⚙ 1 subagent running: Plan t6");
+
+  one.name = "trace-auth";
+  assert.equal(formatSubagentStatus([one]), "⚙ 1 subagent running: trace-auth t6");
+
+  one.usage.turns = 0;
+  assert.equal(formatSubagentStatus([one]), "⚙ 1 subagent running: trace-auth");
+
+  const long = runningTask("task-b");
+  long.name = "an-extremely-long-task-name-for-truncation";
+  assert.equal(formatSubagentStatus([long]), "⚙ 1 subagent running: an-extremely-lo… t6");
+
+  const many = [
+    runningTask("task-c"),
+    runningTask("task-d"),
+    runningTask("task-e"),
+    runningTask("task-f"),
+    runningTask("task-g"),
+  ];
+  assert.equal(formatSubagentStatus(many), "⚙ 5 subagents running: Plan t6, Plan t6, Plan t6, Plan t6 +1");
+});
+
+test("background notifiers refresh the status line on warning and completion", () => {
+  const sent: SentCall[] = [];
+  const known = new Map<string, TaskRecord>();
+  const live = new Map<string, LiveTask>();
+  const taskQuota = createTaskQuota(4);
+  const quotaTasks = new Set<string>();
+  let refreshes = 0;
+  const notifiers = createBackgroundNotifiers({
+    pi: recordingPi(sent),
+    config: () => DEFAULT_CONFIG,
+    taskQuota,
+    quotaTasks,
+    completionDeduper: createCompletionDeduper(),
+    known,
+    live,
+    refreshStatus: () => refreshes++,
+  });
+  const task = runningTask("task-a");
+  live.set(task.id, { record: task } as LiveTask);
+  const invocation = notifiers.beginInvocation(task.id);
+  assert.equal(refreshes, 0);
+  notifiers.notifyProgressWarning(task, WARNING_DETAILS, invocation);
+  assert.equal(refreshes, 1);
+  const done: TaskRecord = { ...task, status: "completed", completedAt: new Date().toISOString() };
+  notifiers.notifyCompletion(done, invocation);
+  assert.equal(refreshes, 2);
+  assert.equal(known.get("task-a"), done);
+  assert.equal(live.has(task.id), false);
+});
+
+test("status widget is not redundantly set while idle and is cleared on shutdown", () => {
+  const reg = registrationPi();
+  register(reg.pi);
+  const widgets: Array<{ key: string; content: unknown; options: unknown }> = [];
+  const ui = {
+    setWidget: (key: string, content: unknown, options: unknown) => {
+      assert.equal(key, "subagents");
+      widgets.push({ key, content, options });
+    },
+  };
+  const ctx = { ...sessionCtx("status-line-session"), hasUI: true, ui };
+  const turnEnd = reg.handlers.get("turn_end") as (event: unknown, ctx: unknown) => unknown;
+  turnEnd({ type: "turn_end" }, ctx);
+  assert.equal(widgets.length, 0, "nothing running and nothing ever set: no redundant set");
+
+  const shutdown = reg.handlers.get("session_shutdown") as (event: unknown, ctx: unknown) => unknown;
+  void shutdown({ type: "session_shutdown" }, ctx);
+  assert.equal(widgets.length, 1, "shutdown clears the widget");
+  assert.equal(widgets[0]!.content, undefined);
+});
+
+test("status refresh on a stale ctx is swallowed, not fatal", () => {
+  const reg = registrationPi();
+  register(reg.pi);
+  const shutdown = reg.handlers.get("session_shutdown") as (event: unknown, ctx: unknown) => unknown;
+  const ctx = {
+    ...sessionCtx("status-stale-session"),
+    hasUI: true,
+    ui: {
+      setWidget: () => {
+        throw new Error(STALE_CTX_MESSAGE);
+      },
+    },
+  };
+  assert.doesNotThrow(() => {
+    void shutdown({ type: "session_shutdown" }, ctx);
+  }, "stale ctx is swallowed, not fatal");
+});
+
+test("status widget renders right-aligned and truncates from the right when narrow", () => {
+  const component = createSubagentStatusComponent("⚙ 1 subagent running: Explore t12");
+  const wide = component.render(80);
+  assert.equal(wide.length, 1);
+  assert.equal(visibleWidth(wide[0]!), 80, "pads to the full line width");
+  assert.ok(wide[0]!.endsWith("Explore t12"), "text sits at the right edge");
+  const narrow = component.render(20);
+  assert.equal(visibleWidth(narrow[0]!), 20, "never exceeds the width");
+  assert.match(narrow[0]!, /…/, "ellipsizes what does not fit");
+  assert.deepEqual(component.render(0), []);
+  assert.deepEqual(createSubagentStatusComponent("").render(40), [], "empty text renders nothing");
 });

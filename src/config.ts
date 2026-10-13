@@ -43,6 +43,8 @@ export interface PiSubagentsConfig {
   proactivePrompt: boolean;
   verificationPrompt: boolean;
   verificationFileThreshold: number;
+  /** Show a footer status line while tasks are running (TUI mode only). */
+  statusLine: boolean;
   cleanupPeriodDays?: number;
   /** How to handle tasks interrupted by a previous parent shutdown on the next session_start. Default "notify". */
   interruptedTaskResume?: "notify" | "auto" | "off";
@@ -72,6 +74,7 @@ export const DEFAULT_CONFIG: PiSubagentsConfig = {
   proactivePrompt: true,
   verificationPrompt: true,
   verificationFileThreshold: 3,
+  statusLine: true,
   cleanupPeriodDays: undefined,
   interruptedTaskResume: "notify",
 };
@@ -236,6 +239,7 @@ export function applyConfig(base: PiSubagentsConfig, raw: Record<string, unknown
     proactivePrompt: booleanValue(raw.proactivePrompt, base.proactivePrompt),
     verificationPrompt: booleanValue(raw.verificationPrompt, base.verificationPrompt),
     verificationFileThreshold: numberValue(raw.verificationFileThreshold, base.verificationFileThreshold, 1),
+    statusLine: booleanValue(raw.statusLine, base.statusLine),
     cleanupPeriodDays: optionalNumberValue(raw.cleanupPeriodDays, base.cleanupPeriodDays, 1),
     interruptedTaskResume: raw.interruptedTaskResume === "auto" || raw.interruptedTaskResume === "off" || raw.interruptedTaskResume === "notify"
       ? raw.interruptedTaskResume

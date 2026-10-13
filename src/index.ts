@@ -8,7 +8,7 @@ import {
   type ExtensionContext,
   type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, truncateToWidth, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { applyAgentModelSettings, discoverAgents, findAgent, resolvePackageRoot, type AgentDefinition } from "./agents.ts";
 import { agentAllowsNestedAgents, type ToolDescriptor } from "./capabilities.ts";
@@ -83,6 +83,11 @@ export function shouldInjectAgentListing(options: {
   }
   return true;
 }
+
+/** Widget key for the TUI status line above the input box. */
+const STATUS_KEY = "subagents";
+/** While tasks run, re-render the status line so turn counts advance while the parent is idle. */
+const STATUS_REFRESH_MS = 4000;
 
 interface TaskDetails {
   tasks: TaskRecord[];
@@ -314,6 +319,8 @@ export interface BackgroundNotifierDeps {
   completionDeduper: CompletionDeduper;
   known: Map<string, TaskRecord>;
   live: Map<string, LiveTask>;
+  /** Called after a task transitions (completion, progress warning) so the TUI status line tracks it off-turn. */
+  refreshStatus?: () => void;
 }
 
 /** One queued XML notification block. Task records and persisted files remain the authority. */
@@ -426,6 +433,7 @@ export function createBackgroundNotifiers(deps: BackgroundNotifierDeps): Backgro
     if (deps.quotaTasks.delete(record.id)) deps.taskQuota.release();
     deps.known.set(record.id, record);
     deps.live.delete(record.id);
+    deps.refreshStatus?.();
     // Nested completions stay with the direct parent; root-only delivery for background tasks.
     if (record.parentTaskId || !record.background || disposed || observedFinal.has(record.id)) return;
     const config = deps.config();
@@ -449,6 +457,7 @@ export function createBackgroundNotifiers(deps: BackgroundNotifierDeps): Backgro
     if (invocation !== undefined && invocation !== generations.get(record.id)) return;
     if (disposed || terminal.has(record.id) || record.status !== "running") return;
     deps.known.set(record.id, record);
+    deps.refreshStatus?.();
     // The warning that releases a blocked foreground Agent wait is already carried by
     // that tool call's result summary; sending it again here would double-report it.
     if (foregroundHeld.delete(record.id)) return;
@@ -581,6 +590,35 @@ export function progressWarningNotification(record: TaskRecord, details: {
   ].filter(Boolean).join("\n");
 }
 
+/**
+ * Footer status text for the given running tasks; undefined clears the status entry.
+ * Names are the user-supplied task name when present, else the agent role.
+ */
+export function formatSubagentStatus(running: TaskRecord[]): string | undefined {
+  if (running.length === 0) return undefined;
+  const label = running.length === 1 ? "1 subagent" : `${running.length} subagents`;
+  const shown = running.slice(0, 4).map(record => {
+    let name = record.name ?? record.agent;
+    if (name.length > 16) name = `${name.slice(0, 15)}…`;
+    return record.usage.turns > 0 ? `${name} t${record.usage.turns}` : name;
+  });
+  const extra = running.length > 4 ? ` +${running.length - 4}` : "";
+  return `⚙ ${label} running: ${shown.join(", ")}${extra}`;
+}
+
+/** Stateless right-aligned single-line widget for the status text; truncates from the right in narrow terminals. */
+export function createSubagentStatusComponent(text: string): Component {
+  return {
+    render(width: number): string[] {
+      if (!text || width <= 0) return [];
+      const line = truncateToWidth(text, width, "…");
+      const pad = Math.max(0, width - visibleWidth(line));
+      return [`${" ".repeat(pad)}${line}`];
+    },
+    invalidate() {},
+  };
+}
+
 function currentParent(pi: ExtensionAPI, ctx: ExtensionContext): ParentLaunchContext {
   const activeTools = new Set(pi.getActiveTools());
   return {
@@ -698,6 +736,48 @@ export default function register(pi: ExtensionAPI): void {
   const taskQuota = createTaskQuota(currentConfig.maxConcurrentTasks);
   const quotaTasks = new Set<string>();
   const completionDeduper = createCompletionDeduper();
+  // Status line above the input box for tasks this process is running. `live` holds the
+  // in-place-mutated records, so turn counts stay fresh between the parent's
+  // own turns; event hooks cover transitions and a short timer keeps the line
+  // moving while the parent is idle. A stale ctx (session replacement/reload)
+  // drops itself: the next event delivers a fresh ctx.
+  let uiCtx: ExtensionContext | undefined;
+  let statusTimer: ReturnType<typeof setInterval> | undefined;
+  let lastStatusText: string | undefined;
+  const stopStatusTimer = () => {
+    if (statusTimer) {
+      clearInterval(statusTimer);
+      statusTimer = undefined;
+    }
+  };
+  const refreshSubagentStatus = (ctx?: ExtensionContext) => {
+    const context = ctx ?? uiCtx;
+    if (!context) return;
+    try {
+      if (!context.hasUI) {
+        stopStatusTimer();
+        return;
+      }
+      const text = currentConfig.statusLine ? formatSubagentStatus([...live.values()].map(task => task.record)) : undefined;
+      if (text !== lastStatusText) {
+        lastStatusText = text;
+        if (text) context.ui.setWidget(STATUS_KEY, () => createSubagentStatusComponent(text), { placement: "aboveEditor" });
+        else context.ui.setWidget(STATUS_KEY, undefined);
+      }
+      if (text === undefined) stopStatusTimer();
+      else if (!statusTimer) {
+        statusTimer = setInterval(() => refreshSubagentStatus(), STATUS_REFRESH_MS);
+        statusTimer.unref?.();
+      }
+    } catch (error) {
+      if (isStaleExtensionContextError(error)) {
+        stopStatusTimer();
+        uiCtx = undefined;
+        return;
+      }
+      console.error("[pi-claude-subagents] status line update failed:", error);
+    }
+  };
   const notifiers = createBackgroundNotifiers({
     pi,
     config: () => currentConfig,
@@ -706,6 +786,7 @@ export default function register(pi: ExtensionAPI): void {
     completionDeduper,
     known,
     live,
+    refreshStatus: () => refreshSubagentStatus(),
   });
   const { notifyCompletion, notifyProgressWarning } = notifiers;
 
@@ -796,6 +877,7 @@ export default function register(pi: ExtensionAPI): void {
     if (quotaTasks.delete(record.id)) taskQuota.release();
     known.set(record.id, record);
     live.delete(record.id);
+    refreshSubagentStatus();
   };
 
   const handleTaskCompletion = (record: TaskRecord, invocation?: number) => {
@@ -807,6 +889,8 @@ export default function register(pi: ExtensionAPI): void {
 
   pi.on("session_start", (_event, ctx) => {
     reload(ctx);
+    uiCtx = ctx;
+    refreshSubagentStatus(ctx);
     void cleanupExpiredTasks(currentConfig.cleanupPeriodDays);
     const mode = currentConfig.interruptedTaskResume;
     const candidates = selectInterruptedTasks(loadTaskRecords(parentSessionId));
@@ -824,6 +908,7 @@ export default function register(pi: ExtensionAPI): void {
         for (const candidate of resumable) {
           outcomes.push(await resumeInterruptedTask(ctx, candidate.record));
         }
+        refreshSubagentStatus(ctx);
         const failures = outcomes.filter((outcome): outcome is Extract<AutoResumeOutcome, { ok: false }> => !outcome.ok);
         const notice = formatInterruptedTasksNotice(candidates, {
           autoResumed: failures.length === 0,
@@ -864,11 +949,30 @@ export default function register(pi: ExtensionAPI): void {
 
   // Keep the notifier's parent-busy state consistent with the Pi agent loop so buffered
   // notifications flush into the next tool gap instead of waiting out the whole turn.
-  pi.on("agent_start", () => notifiers.onAgentStart());
-  pi.on("turn_end", () => notifiers.onTurnEnd());
-  pi.on("agent_settled", () => notifiers.onAgentSettled());
+  // The same events refresh the footer status line with the fresh ctx.
+  pi.on("agent_start", (_event, ctx) => {
+    uiCtx = ctx;
+    notifiers.onAgentStart();
+    refreshSubagentStatus(ctx);
+  });
+  pi.on("turn_end", (_event, ctx) => {
+    uiCtx = ctx;
+    notifiers.onTurnEnd();
+    refreshSubagentStatus(ctx);
+  });
+  pi.on("agent_settled", (_event, ctx) => {
+    uiCtx = ctx;
+    notifiers.onAgentSettled();
+    refreshSubagentStatus(ctx);
+  });
 
-  pi.on("session_shutdown", async () => {
+  pi.on("session_shutdown", async (_event, ctx) => {
+    stopStatusTimer();
+    try {
+      if (ctx.hasUI) ctx.ui.setWidget(STATUS_KEY, undefined);
+    } catch (error) {
+      if (!isStaleExtensionContextError(error)) throw error;
+    }
     notifiers.onSessionShutdown();
     const shuttingDown = [...live.values()];
     // Keep live handles until persist finishes so a concurrent reload cannot
@@ -1039,6 +1143,7 @@ export default function register(pi: ExtensionAPI): void {
         } catch (error) {
           for (const task of launched) task.abortController.abort("sibling task failed during launch");
           await Promise.allSettled(launched.map(task => task.promise));
+          refreshSubagentStatus(ctx);
           if (heldPermit) {
             taskQuota.release();
             heldPermit = false;
@@ -1054,6 +1159,7 @@ export default function register(pi: ExtensionAPI): void {
         }
         await waitForLaunchedForegroundTasks(launched, signal ?? undefined);
         foregroundReturned = true;
+        refreshSubagentStatus(ctx);
         for (const task of launched) notifiers.releaseForegroundWarning(task.record.id);
         const summaries = launched.map(task => {
           if (task.record.status === "running" && task.record.lastWarningTurn !== undefined) {
@@ -1160,6 +1266,7 @@ export default function register(pi: ExtensionAPI): void {
           onProgressWarning: (r, details) => notifyProgressWarning(r, details, r.id === record.id ? invocation : undefined),
         });
         if (resumed.record.completedAt === undefined) live.set(record.id, resumed);
+        refreshSubagentStatus(ctx);
         return taskResult([resumed.record], `Resumed ${record.description} in background.`);
       } catch (error) {
         taskQuota.release();

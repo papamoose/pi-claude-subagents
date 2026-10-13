@@ -297,13 +297,28 @@ test("dispatch matches the Pi orchestration contract", () => {
 });
 
 test("discovery falls back when packageRoot is stale", () => {
-  const result = discoverAgents({
-    cwd: packageRoot,
-    packageRoot: path.join(os.tmpdir(), "missing-pi-claude-subagents-root"),
-    includeProject: false,
-  });
-  assert.ok(result.agents.some(agent => agent.name === "Explore"));
-  assert.ok(result.agents.some(agent => agent.name === "general-purpose"));
+  // Hermetic: point the agent dir at a temp tree that mimics an npm install,
+  // so the fallback does not depend on how this machine has the package installed.
+  const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-agent-dir-"));
+  const fallbackAgents = path.join(agentDir, "npm", "node_modules", "pi-claude-subagents", "agents");
+  fs.mkdirSync(fallbackAgents, { recursive: true });
+  fs.writeFileSync(path.join(fallbackAgents, "explore.md"), "---\nname: Explore\ndescription: Fallback explore agent\n---\nBody.\n");
+  fs.writeFileSync(path.join(fallbackAgents, "general-purpose.md"), "---\nname: general-purpose\ndescription: Fallback general-purpose agent\n---\nBody.\n");
+  const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = agentDir;
+  try {
+    const result = discoverAgents({
+      cwd: packageRoot,
+      packageRoot: path.join(os.tmpdir(), "missing-pi-claude-subagents-root"),
+      includeProject: false,
+    });
+    assert.ok(result.agents.some(agent => agent.name === "Explore"));
+    assert.ok(result.agents.some(agent => agent.name === "general-purpose"));
+  } finally {
+    if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+    fs.rmSync(agentDir, { recursive: true, force: true });
+  }
 });
 
 test("fork dispatch works even when no named agents are discovered", () => {
