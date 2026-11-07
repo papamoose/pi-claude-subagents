@@ -25,6 +25,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { createTaskQuota, type ProgressWarningDetails } from "../src/runtime.ts";
 import { getAgentDir, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { appendTaskOutput, formatTaskOutputForModel, saveTaskOutput, type LiveTask, type TaskRecord } from "../src/tasks.ts";
+import { TasksPanelComponent } from "../src/tasks-panel.ts";
 
 function partialTask(): TaskRecord {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-index-test-"));
@@ -1094,4 +1095,45 @@ test("status widget renders right-aligned and truncates from the right when narr
   assert.match(narrow[0]!, /…/, "ellipsizes what does not fit");
   assert.deepEqual(component.render(0), []);
   assert.deepEqual(createSubagentStatusComponent("").render(40), [], "empty text renders nothing");
+});
+
+test("subagents command opens the panel in TUI mode and falls back to a plain list otherwise", async () => {
+  const reg = registrationPi();
+  register(reg.pi);
+  const command = reg.commands.get("subagents") as { handler: (args: string, ctx: unknown) => Promise<void> };
+  assert.ok(command, "subagents command is registered");
+
+  const notices: string[] = [];
+  await command.handler("", {
+    mode: "print",
+    hasUI: true,
+    ui: { notify: (message: string) => notices.push(message) },
+  });
+  assert.equal(notices.length, 1);
+  assert.match(notices[0]!, /Running subagents/);
+  assert.match(notices[0]!, /none/);
+
+  let factoryOptions: { overlay?: boolean; overlayOptions?: { anchor?: string } } | undefined;
+  let created: unknown;
+  await command.handler("", {
+    mode: "tui",
+    hasUI: true,
+    cwd: os.tmpdir(),
+    ui: {
+      custom: (factory: (tui: unknown, theme: unknown, keybindings: unknown, done: (result?: unknown) => void) => unknown, options?: { overlay?: boolean; overlayOptions?: { anchor?: string } }) => {
+        factoryOptions = options;
+        created = factory(
+          { requestRender: () => {}, terminal: { columns: 100, rows: 40 } },
+          { fg: (_color: string, text: string) => text, bg: (_color: string, text: string) => text, bold: (text: string) => text },
+          { matches: () => false },
+          () => {},
+        );
+        return Promise.resolve(undefined);
+      },
+    },
+  });
+  assert.equal(factoryOptions?.overlay, true, "panel is a floating overlay");
+  assert.deepEqual(factoryOptions?.overlayOptions, { row: 0, col: 0, width: "100%", maxHeight: "100%" }, "panel is full-screen");
+  assert.ok(created instanceof TasksPanelComponent, "factory builds the tasks panel");
+  (created as TasksPanelComponent).dispose();
 });

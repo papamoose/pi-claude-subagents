@@ -363,6 +363,7 @@ const unsubscribe = pi.events.on(SUBAGENT_CHILD_EVENT_CHANNEL, data => {
 ## Commands
 
 - `/agents` — list subagents and current tasks
+- `/subagents` — open the full-screen subagent panel: running tasks (with recently finished/stopped ones on demand), a live scrollable view of the selected task's session (rendered with the primary-window chat components), and a message box for the selected task. Keys: `↑↓` switch task, `f` show/hide finished tasks, mouse wheel / `PgUp`/`PgDn` scroll (the view follows the tail until you scroll up), `Home`/`End` jump, `Enter` opens the message box (the main TUI's input editor — `Enter` sends, `Shift+Enter` newline, `Esc` returns; sending to a finished task resumes it, same semantics as `SendMessage`), `esc`/`Ctrl-C`/`q` close. In non-TUI modes it prints a plain list of running tasks instead.
 - `/pi-subagents-doctor` — inspect discovery and configuration
 
 ## Develop / validate

@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import {
   getAgentDir,
+  getMarkdownTheme,
   type AgentToolResult,
   type ExtensionAPI,
   type ExtensionContext,
@@ -35,6 +36,7 @@ import {
   type LiveTask,
   type TaskRecord,
 } from "./tasks.ts";
+import { panelTaskInfos, runningTaskInfos, TasksPanelComponent } from "./tasks-panel.ts";
 
 const packageRoot = resolvePackageRoot(import.meta.url);
 
@@ -1207,6 +1209,79 @@ export default function register(pi: ExtensionAPI): void {
     },
   });
 
+  /**
+   * Deliver a message to a task with the same semantics as the SendMessage
+   * tool: queue it on the live task if running, otherwise resume the
+   * persisted task with it as a new prompt. Rejects when the task cannot
+   * accept a message. Returns a short user-facing note and the resulting
+   * task record.
+   */
+  async function deliverTaskMessage(record: TaskRecord, message: string, ctx: ExtensionContext, signal?: AbortSignal): Promise<{ note: string; record: TaskRecord }> {
+    if (record.oneShot) throw new Error(`${record.agent} uses one-shot execution. Start a new ${record.agent} task for the next assignment.`);
+    if (record.worktreeCleaned) throw new Error(`Task ${record.id} used an isolated worktree that was cleaned after a no-change run. Start a new isolated task instead of resuming it.`);
+    const liveTask = live.get(record.id);
+    if (liveTask) {
+      await liveTask.send(message);
+      return { note: `Message delivered to ${record.description}.`, record };
+    }
+    // A resume already in flight owns the session file; a second concurrent
+    // resume of the same task would spawn a duplicate child.
+    if (resuming.has(record.id)) {
+      throw new Error(`Task ${record.description} is already being resumed; send again once it starts.`);
+    }
+    const agent = findAgent(currentAgents, record.agent);
+    if (!agent) throw new Error(`Agent definition no longer exists: ${record.agent}`);
+    // Reserve the resume slot before waiting for quota: two concurrent sends
+    // to the same finished task must not both start a resume, and a pending
+    // resume also protects a restored record from orphan handling.
+    resuming.add(record.id);
+    let acquired = false;
+    try {
+      await taskQuota.acquire(1, signal ?? undefined);
+      acquired = true;
+      // Preparation works on a separate record. Only a successful initial
+      // persistence commits the new notification generation; failed resume
+      // must leave the prior record and its pending final result intact.
+      let invocation: number | undefined;
+      const resumeRecord = structuredClone(record);
+      const resumed = await resumeCompletedTask({
+        record: resumeRecord,
+        onPrepared: () => {
+          invocation = notifiers.beginInvocation(record.id);
+          known.set(record.id, resumeRecord);
+          quotaTasks.add(record.id);
+        },
+        message,
+        agent,
+        agents: currentAgents,
+        parent: {
+          ...currentParent(pi, ctx),
+          parentSessionId: record.rootParentSessionId ?? record.parentSessionId,
+          rootParentSessionId: record.rootParentSessionId ?? record.parentSessionId,
+          parentTaskId: record.parentTaskId,
+          depth: Math.max(0, (record.depth ?? 1) - 1),
+          taskQuota,
+        },
+        config: currentConfig,
+        onTaskStarted: nested => {
+          known.set(nested.record.id, nested.record);
+          live.set(nested.record.id, nested);
+          quotaTasks.add(nested.record.id);
+        },
+        onComplete: r => notifyCompletion(r, r.id === record.id ? invocation : undefined),
+        onProgressWarning: (r, details) => notifyProgressWarning(r, details, r.id === record.id ? invocation : undefined),
+      });
+      if (resumed.record.completedAt === undefined) live.set(record.id, resumed);
+      refreshSubagentStatus(ctx);
+      return { note: `Resumed ${record.description} in background.`, record: resumed.record };
+    } catch (error) {
+      if (acquired) taskQuota.release();
+      throw error;
+    } finally {
+      resuming.delete(record.id);
+    }
+  }
+
   pi.registerTool({
     name: "SendMessage",
     label: "Send Message",
@@ -1217,62 +1292,11 @@ export default function register(pi: ExtensionAPI): void {
       const resolution = resolveTaskTarget([...known.values()], params.to);
       if (resolution.kind !== "found") return taskResult([], formatTaskTargetError(resolution), true);
       const record = resolution.task;
-      if (record.oneShot) return taskResult([record], `${record.agent} uses one-shot execution. Start a new ${record.agent} task for the next assignment.`, true);
-      if (record.worktreeCleaned) return taskResult([record], `Task ${record.id} used an isolated worktree that was cleaned after a no-change run. Start a new isolated task instead of resuming it.`, true);
-      const liveTask = live.get(record.id);
-      if (liveTask) {
-        await liveTask.send(params.message);
-        return taskResult([record], `Message delivered to ${record.description}.`);
-      }
-      const agent = findAgent(currentAgents, record.agent);
-      if (!agent) return taskResult([record], `Agent definition no longer exists: ${record.agent}`, true);
       try {
-        await taskQuota.acquire(1, signal ?? undefined);
+        const result = await deliverTaskMessage(record, params.message, ctx, signal ?? undefined);
+        return taskResult([result.record], result.note);
       } catch (error) {
         return taskResult([record], error instanceof Error ? error.message : String(error), true);
-      }
-      resuming.add(record.id);
-      try {
-        // Preparation works on a separate record. Only a successful initial
-        // persistence commits the new notification generation; failed resume
-        // must leave the prior record and its pending final result intact.
-        let invocation: number | undefined;
-        const resumeRecord = structuredClone(record);
-        const resumed = await resumeCompletedTask({
-          record: resumeRecord,
-          onPrepared: () => {
-            invocation = notifiers.beginInvocation(record.id);
-            known.set(record.id, resumeRecord);
-            quotaTasks.add(record.id);
-          },
-          message: params.message,
-          agent,
-          agents: currentAgents,
-          parent: {
-            ...currentParent(pi, ctx),
-            parentSessionId: record.rootParentSessionId ?? record.parentSessionId,
-            rootParentSessionId: record.rootParentSessionId ?? record.parentSessionId,
-            parentTaskId: record.parentTaskId,
-            depth: Math.max(0, (record.depth ?? 1) - 1),
-            taskQuota,
-          },
-          config: currentConfig,
-          onTaskStarted: nested => {
-            known.set(nested.record.id, nested.record);
-            live.set(nested.record.id, nested);
-            quotaTasks.add(nested.record.id);
-          },
-          onComplete: r => notifyCompletion(r, r.id === record.id ? invocation : undefined),
-          onProgressWarning: (r, details) => notifyProgressWarning(r, details, r.id === record.id ? invocation : undefined),
-        });
-        if (resumed.record.completedAt === undefined) live.set(record.id, resumed);
-        refreshSubagentStatus(ctx);
-        return taskResult([resumed.record], `Resumed ${record.description} in background.`);
-      } catch (error) {
-        taskQuota.release();
-        return taskResult([record], error instanceof Error ? error.message : String(error), true);
-      } finally {
-        resuming.delete(record.id);
       }
     },
   });
@@ -1344,6 +1368,36 @@ export default function register(pi: ExtensionAPI): void {
       const agents = currentAgents.map(agent => `${agent.name} — ${agent.description}`).join("\n");
       const tasks = [...known.values()].slice(0, 20).map(task => `${task.status.padEnd(9)} ${task.id.slice(0, 8)} ${task.description}`).join("\n");
       ctx.ui.notify(`Agents:\n${agents || "none"}\n\nRecent tasks:\n${tasks || "none"}`, "info");
+    },
+  });
+
+  pi.registerCommand("subagents", {
+    description: "Open the full-screen subagent panel: running and recent tasks, a scrollable live view, and a message line for the selected task",
+    handler: async (_args, ctx) => {
+      if (ctx.mode !== "tui") {
+        const running = runningTaskInfos([...live.values()].map(task => task.record));
+        const list = running.map(task => `${task.name} (${task.agent}) — turn ${task.turns}, ${task.toolCalls} tool calls${task.preview ? ` — ${task.preview}` : ""}`).join("\n");
+        ctx.ui.notify(`Running subagents:\n${list || "none"}`, "info");
+        return;
+      }
+      await ctx.ui.custom<{ id: string } | undefined>(
+        (tui, theme, keybindings, done) =>
+          new TasksPanelComponent({
+            getTasks: () => panelTaskInfos([...known.values()], 12),
+            tui,
+            theme,
+            markdownTheme: getMarkdownTheme(),
+            keybindings,
+            cwd: ctx.cwd,
+            done,
+            sendToTask: (taskId, message) => {
+              const record = known.get(taskId);
+              if (!record) return Promise.reject(new Error("task is no longer known to this session"));
+              return deliverTaskMessage(record, message, ctx).then(result => result.note);
+            },
+          }),
+        { overlay: true, overlayOptions: { row: 0, col: 0, width: "100%", maxHeight: "100%" } },
+      );
     },
   });
 
